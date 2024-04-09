@@ -23,6 +23,7 @@
 #  along with SmartHomeNG. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
+import time
 
 from lib.model.smartplugin import *
 from lib.item import Items
@@ -35,16 +36,17 @@ from pymodbus.constants import Endian
 from pymodbus.payload import BinaryPayloadDecoder
 from pymodbus.payload import BinaryPayloadBuilder
 
-from pymodbus.version import version
+# from pymodbus.constants import Defaults
+# Defaults.RetryOnEmpty = False
+# Defaults.HandleLocalEcho = True
 
-pymodbus_baseversion = int(version.short().split('.')[0])
+from pymodbus.client.serial import ModbusSerialClient
 
-if pymodbus_baseversion > 2:
-    # for newer versions of pymodbus
-    from pymodbus.client.serial import ModbusSerialClient
-else:
-    # for older versions of pymodbus
-    from pymodbus.client.sync import ModbusSerialClient
+import fcntl
+import struct
+from serial import Serial, PARITY_NONE
+
+from umodbus.client.serial import rtu
 
 AttrAddress = 'modBusRtuAddress'
 AttrType = 'modBusRtuDataType'
@@ -89,7 +91,8 @@ class modbus_rtu(SmartPlugin):
             self._parity = 'None'
 
         self._Mclient = ModbusSerialClient(method='rtu', port=self._tty, baudrate=self._baud,
-                                           parity=self._parity[0], stopbits=self._stopbits)
+                                           parity=self._parity[0], stopbits=self._stopbits,
+                                           timeout=1, retries=0, ignore_missing_slaves=True)
         self.lock = threading.Lock()
 
         self.init_webinterface(WebInterface)
@@ -100,18 +103,34 @@ class modbus_rtu(SmartPlugin):
         """
         Run method for the plugin
         """
-        self.scheduler_add('poll_device_' + self._tty, self.poll_device, cycle=self._cycle, prio=5)
+        self.logger.debug("Start modbus_rtu plugin")
+        self.__addScheduler()
         self.alive = True
 
     def stop(self):
         """
         Stop method for the plugin
         """
+        self.logger.debug("Stop modbus_rtu plugin")
+        self.__removeScheduler()
         self.alive = False
-        self.logger.debug("stop modbus_rtu plugin")
+
+    def __addScheduler(self):
+        self.scheduler_add('poll_device_' + self._tty, self.poll_device, cycle=self._cycle, prio=5)
+
+    def __removeScheduler(self):
         self.scheduler_remove('poll_device_' + self._tty)
-        self._Mclient.close()
-        self.connected = False
+
+        while self.lock.locked():
+            time.sleep(0.01)
+
+        if self.connected:
+            with self.lock:
+                try:
+                    self._Mclient.close()
+                except Exception as e:
+                    self.logger.error("Exception during closing connection: {0} {1}".format(str(self._Mclient), e))
+            self.connected = False
 
     def parse_item(self, item):
         """
@@ -129,8 +148,8 @@ class modbus_rtu(SmartPlugin):
             value = item()
             dataType = 'uint16'
             factor = 1
-            byteOrder = 'Endian.Big'
-            wordOrder = 'Endian.Big'
+            byteOrderString = 'Endian.Big'
+            wordOrderString = 'Endian.Big'
             slaveUnit = 1
             dataDirection = 'read'
 
@@ -155,22 +174,24 @@ class modbus_rtu(SmartPlugin):
             if self.has_iattr(item.conf, AttrFactor):
                 factor = float(self.get_iattr_value(item.conf, AttrFactor))
             if self.has_iattr(item.conf, AttrByteOrder):
-                byteOrder = self.get_iattr_value(item.conf, AttrByteOrder)
+                byteOrderString = self.get_iattr_value(item.conf, AttrByteOrder)
             if self.has_iattr(item.conf, AttrWordOrder):
-                wordOrder = self.get_iattr_value(item.conf, AttrWordOrder)
-            if byteOrder == 'Endian.Big':  # Von String in Endian-Konstante "umwandeln"
-                byteOrder = Endian.Big
-            elif byteOrder == 'Endian.Little':
-                byteOrder = Endian.Little
+                wordOrderString = self.get_iattr_value(item.conf, AttrWordOrder)
+
+            if byteOrderString == 'Endian.Big':  # Von String in Endian-Konstante "umwandeln"
+                byteOrder = Endian.BIG
+            elif byteOrderString == 'Endian.Little':
+                byteOrder = Endian.LITTLE
             else:
-                byteOrder = Endian.Big
+                byteOrder = Endian.BIG
                 self.logger.warning("Invalid byte order -> default(Endian.Big) is used")
-            if wordOrder == 'Endian.Big':  # Von String in Endian-Konstante "umwandeln"
-                wordOrder = Endian.Big
-            elif wordOrder == 'Endian.Little':
-                wordOrder = Endian.Little
+
+            if wordOrderString == 'Endian.Big':  # Von String in Endian-Konstante "umwandeln"
+                wordOrder = Endian.BIG
+            elif wordOrderString == 'Endian.Little':
+                wordOrder = Endian.LITTLE
             else:
-                wordOrder = Endian.Big
+                wordOrder = Endian.BIG
                 self.logger.warning("Invalid byte order -> default(Endian.Big) is used")
 
             regPara = {'regAddr': regAddr, 'slaveUnit': slaveUnit, 'dataType': dataType, 'factor': factor,
@@ -198,31 +219,30 @@ class modbus_rtu(SmartPlugin):
         Polls for updates of the device
 
         This method is only needed, if the device (hardware/interface) does not propagate
-        changes on it's own, but has to be polled to get the actual status.
+        changes on its own, but has to be polled to get the actual status.
         It is called by the scheduler which is set within run() method.
         """
 
         with self.lock:
             try:
-                if self._Mclient.connect():
-                    self.logger.info("connected to {0}".format(str(self._Mclient)))
-                    self.connected = True
-                else:
-                    self.logger.error("could not connect to {0} ({1}Bd)".format(self._tty, self._baud))
-                    self.connected = False
-                    return
+                if not self.connected:
+                    if self._Mclient.connect():
+                        self.logger.info("connected to {0}".format(str(self._Mclient)))
+                        self.connected = True
+                    else:
+                        self.logger.error("could not connect to {0} ({1}Bd)".format(self._tty, self._baud))
+                        self.connected = False
+                        return
 
             except Exception as e:
                 self.logger.error("connection expection: {0} {1}".format(str(self._Mclient), e))
                 self.connected = False
                 return
 
-        startTime = datetime.now()
-        regCount = 0
-        try:
-            for reg, regPara in self._regToRead.items():
-                with self.lock:
-                    regAddr = regPara['regAddr']
+            startTime = datetime.now()
+            regCount = 0
+            try:
+                for reg, regPara in self._regToRead.items():
                     value = self.__read_Registers(regPara)
                     # self.logger.debug("value readed: {0} type: {1}".format(value, type(value)))
                     if value is not None:
@@ -241,14 +261,14 @@ class modbus_rtu(SmartPlugin):
 
                         regPara['read_dt'] = datetime.now()
                         regPara['value'] = value
-            endTime = datetime.now()
-            duration = endTime - startTime
-            if regCount > 0:
-                self._pollStatus['last_dt'] = datetime.now()
-                self._pollStatus['regCount'] = regCount
-            self.logger.debug("poll_device: {0} register readed requed-time: {1}".format(regCount, duration))
-        except Exception as e:
-            self.logger.error("something went wrong in the poll_device function: {0}".format(e))
+                endTime = datetime.now()
+                duration = endTime - startTime
+                if regCount > 0:
+                    self._pollStatus['last_dt'] = datetime.now()
+                    self._pollStatus['regCount'] = regCount
+                self.logger.debug("poll_device: {0} register readed requed-time: {1}".format(regCount, duration))
+            except Exception as e:
+                self.logger.error("something went wrong in the poll_device function: {0}".format(e))
 
     # called each time an item changes.
     def update_item(self, item, caller=None, source=None, dest=None):
@@ -264,6 +284,7 @@ class modbus_rtu(SmartPlugin):
         :param source: if given it represents the source
         :param dest: if given it represents the dest
         """
+        value = item()
         objectType = 'HoldingRegister'
         slaveUnit = 1
         dataDirection = 'read'
@@ -275,7 +296,7 @@ class modbus_rtu(SmartPlugin):
         if self.has_iattr(item.conf, AttrDirection):
             dataDirection = self.get_iattr_value(item.conf, AttrDirection)
             if not (dataDirection == 'read_write' or dataDirection == 'write'):
-                self.logger.debug(
+                self.logger.warning(
                     'update_item:{0} Writing is not allowed - selected dataDirection:{1}'.format(item, dataDirection))
                 return
             # else:
@@ -298,52 +319,27 @@ class modbus_rtu(SmartPlugin):
             reg += '.'
             reg += str(slaveUnit)
             if reg in self._regToWrite:
-                with self.lock:
-                    regPara = self._regToWrite[reg]
-                    self.logger.debug('update_item:{0} value:{1} regToWrite:{2}'.format(item, item(), reg))
-                    try:
-                        if self._Mclient.connect():
-                            self.logger.info("connected to {0}".format(str(self._Mclient)))
-                            self.connected = True
-                        else:
-                            self.logger.error("could not connect to {0} ({1}Bd)".format(self._tty, self._baud))
-                            self.connected = False
-                            return
-
-                    except Exception as e:
-                        self.logger.error("connection expection: {0} {1}".format(str(self._Mclient), e))
-                        self.connected = False
-                        return
-
-                    try:
-                        self.__write_Registers(regPara, item())
-                    except Exception as e:
-                        self.logger.error("something went wrong in the __write_Registers function: {0}".format(e))
-
-    def sendAllWriteReg(self, returnval=None):
-        for reg, regPara in self._regToWrite.items():
-            with self.lock:
-                self.logger.debug(
-                    'update_item:{0} value:{1} regToWrite:{2}'.format(regPara['item'], regPara['item'](), reg))
-                try:
-                    if self._Mclient.connect():
-                        self.logger.info("connected to {0}".format(str(self._Mclient)))
-                        self.connected = True
-                    else:
-                        self.logger.error("could not connect to {0} ({1}Bd)".format(self._tty, self._baud))
-                        self.connected = False
-                        return
-
-                except Exception as e:
-                    self.logger.error("connection expection: {0} {1}".format(str(self._Mclient), e))
-                    self.connected = False
-                    return
+                self.__removeScheduler()
+                regPara = self._regToWrite[reg]
+                self.logger.debug('update_item:{0} value:{1} regToWrite:{2}'.format(item, value, reg))
 
                 try:
-                    self.__write_Registers(regPara, regPara['item']())
+                    self.__write_Registers(regPara, value)
                 except Exception as e:
                     self.logger.error("something went wrong in the __write_Registers function: {0}".format(e))
+                self.__addScheduler()
 
+    def sendAllWriteReg(self, returnval=None):
+        self.__removeScheduler()
+        for reg, regPara in self._regToWrite.items():
+            self.logger.debug(
+                'update_item:{0} value:{1} regToWrite:{2}'.format(regPara['item'], regPara['item'](), reg))
+
+            try:
+                self.__write_Registers(regPara, regPara['item']())
+            except Exception as e:
+                self.logger.error("something went wrong in the __write_Registers function: {0}".format(e))
+        self.__addScheduler()
         return returnval
 
     def __write_Registers(self, regPara, value):
@@ -353,25 +349,18 @@ class modbus_rtu(SmartPlugin):
         bo = regPara['byteOrder']
         wo = regPara['wordOrder']
         dataTypeStr = regPara['dataType']
-        dataType = ''.join(filter(str.isalpha, dataTypeStr))  # vom dataType die Ziffen entfernen z.B. uint16 = uint
-        registerCount = 0  # Anzahl der zu schreibenden Register (Words)
+        dataType = ''.join(filter(str.isalpha, dataTypeStr))  # vom dataType die Ziffern entfernen z.B. uint16 = uint
 
         try:
             bits = int(''.join(filter(str.isdigit, dataTypeStr)))  # bit-Zahl aus aus dataType z.B. uint16 = 16
         except:
             bits = 16
 
-        if dataType.lower() == 'string':
-            registerCount = int(bits / 2)  # bei string: bits = bytes !! string16 -> 16Byte - 8 registerCount
-        else:
-            registerCount = int(bits / 16)
-
         if regPara['factor'] != 1:
-            # self.logger.debug("value {0} divided by: {1}".format(value, regPara['factor']))
             value = value * (1 / regPara['factor'])
 
         self.logger.debug(
-            "write {0} to {1}.{2}.{3} (address.slaveUnit) dataType:{4}".format(value, objectType, address, slaveUnit,
+            "write {0} to {1} {2}.{3} (address.slaveUnit) dataType:{4}".format(value, objectType, address, slaveUnit,
                                                                                dataTypeStr))
         builder = BinaryPayloadBuilder(byteorder=bo, wordorder=wo)
 
@@ -417,10 +406,10 @@ class modbus_rtu(SmartPlugin):
             return None
 
         if objectType == 'Coil':
-            result = self._Mclient.write_coil(address, value, unit=slaveUnit)
+            message = rtu.write_single_coil(slave_id=slaveUnit, address=address, value=value)
         elif objectType == 'HoldingRegister':
-            registers = builder.to_registers()
-            result = self._Mclient.write_registers(address, registers, unit=slaveUnit)
+            payload = builder.to_registers()
+            message = rtu.write_multiple_registers(slave_id=slaveUnit, starting_address=address, values=payload)
         elif objectType == 'DiscreteInput':
             self.logger.warning(
                 "this object type cannot be written {0}:{1} slaveUnit:{2}".format(objectType, address, slaveUnit))
@@ -431,10 +420,11 @@ class modbus_rtu(SmartPlugin):
             return
         else:
             return
-        if result.isError():
-            self.logger.error(
-                "write error: {0} {1}.{2}.{3} (address.slaveUnit)".format(result, objectType, address, slaveUnit))
-            return None
+
+        serial_port = Serial(port=self._tty, baudrate=self._baud, parity=self._parity[0],
+                             stopbits=self._stopbits, bytesize=8, timeout=1)
+        response = rtu.send_message(message, serial_port)
+        serial_port.close()
 
         if 'write_dt' in regPara:
             regPara['last_write_dt'] = regPara['write_dt']
@@ -470,10 +460,11 @@ class modbus_rtu(SmartPlugin):
             registerCount = int(bits / 16)
 
         if self.connected == False:
-            self.logger.error(" not connect {0} ({1}Bd)".format(self._tty, self._baud))
+            self.logger.error(" not connected to {0} ({1}Bd)".format(self._tty, self._baud))
             return None
 
-        # self.logger.debug("read {0}.{1}.{2} (address.slaveUnit) regCount:{3}".format(objectType, address, slaveUnit, registerCount))
+        self.logger.debug(
+            "read {0}.{1}.{2} (address.slaveUnit) regCount:{3}".format(objectType, address, slaveUnit, registerCount))
         if objectType == 'Coil':
             result = self._Mclient.read_coils(address, registerCount, slave=slaveUnit)
         elif objectType == 'DiscreteInput':
@@ -487,7 +478,7 @@ class modbus_rtu(SmartPlugin):
             return None
 
         if result.isError():
-            self.logger.error(
+            self.logger.debug(
                 "read error: {0} {1}.{2}.{3} (address.slaveUnit) regCount:{4}".format(result, objectType, address,
                                                                                       slaveUnit, registerCount))
             return None
